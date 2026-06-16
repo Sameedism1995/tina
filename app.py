@@ -352,23 +352,10 @@ class TinaApp:
         # Empty state
         if not self._projects and not self._folder_projects:
             self._gap(self._body, 12)
-            tk.Label(self._body, text="Nothing running.",
+            tk.Label(self._body, text="Nothing detected.",
                      bg=BG, fg=DIM, font=F_MD).pack(anchor="w", padx=24)
-            tk.Label(self._body, text="Start a project and it will appear here.",
+            tk.Label(self._body, text="Start a dev server or open a project folder.",
                      bg=BG, fg=DIM2, font=F_SM).pack(anchor="w", padx=24, pady=(2, 0))
-
-        # LOG
-        log = self._state.get("log", [])
-        if log:
-            self._sep(self._body)
-            self._section(self._body, "Log")
-            for entry in log[:10]:
-                row = tk.Frame(self._body, bg=BG)
-                row.pack(fill="x", padx=24, pady=1)
-                tk.Label(row, text=f"[TINA] {entry['event']}",
-                         bg=BG, fg=DIM, font=F_MONO_SM, anchor="w").pack(side="left")
-                tk.Label(row, text=entry["ts"],
-                         bg=BG, fg=DIM2, font=F_MONO_SM).pack(side="right")
 
         # Settings link
         self._sep(self._body, (20, 8))
@@ -639,6 +626,13 @@ class TinaApp:
         try:
             procs    = self._monitor.scan()
             projects = self._monitor.group_into_projects(procs)
+            # Drop Tina itself, root processes, and unnamed projects
+            projects = [
+                p for p in projects
+                if p.name
+                and p.cwd != "/"
+                and "Tina.app" not in (p.cwd or "")
+            ]
         except Exception as exc:
             print(f"[TINA] scan error: {exc}")
             projects = []
@@ -655,13 +649,18 @@ class TinaApp:
         self._scanning        = False
 
         # Ensure every detected project has a timer slot
+        project_names = {p.name for p in self._projects}
         for p in self._projects:
             if p.name not in self._timers:
                 self._timers[p.name] = TimerState()
 
+        # Clear active_focus if it points to a project no longer detected
+        active = self._state.get("active_focus")
+        if active and active not in project_names:
+            self._state["active_focus"] = None
+
         ts = datetime.now().strftime("%H:%M:%S")
         self._status_var.set(f"last scan: {ts}")
-        append_log(self._state, "Project scan completed")
         self._render()
 
     # Override _trigger_scan to also launch thread
