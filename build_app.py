@@ -16,7 +16,7 @@ from pathlib import Path
 
 TINA_DIR = Path(__file__).parent.resolve()
 APP_PATH = TINA_DIR / "Tina.app"
-ICON_SRC = Path("/Users/sameedahmed/Desktop/tina1.png")
+ICON_SRC = Path("/Users/sameedahmed/Downloads/tinaicon.png")
 
 
 PY_FILES = ["app.py", "monitor.py", "detector.py", "reporter.py",

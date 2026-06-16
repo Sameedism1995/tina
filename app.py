@@ -37,6 +37,7 @@ from monitor        import ProcessMonitor
 from folder_tracker import FolderScanner, FolderProject
 from persistence    import load_state, save_state, append_log
 from wake_monitor   import WakeMonitor
+from ai_monitor     import AIMonitor
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 BG    = "#111111"
@@ -76,6 +77,42 @@ PORT_NAMES: dict[int, str] = {
 }
 
 
+# Known remote services by hostname fragment
+KNOWN_APIS: list[tuple[str, str]] = [
+    ("openai.com",      "OpenAI"),
+    ("anthropic.com",   "Anthropic"),
+    ("claude.ai",       "Claude"),
+    ("github.com",      "GitHub"),
+    ("api.github.com",  "GitHub API"),
+    ("githubusercontent","GitHub CDN"),
+    ("stripe.com",      "Stripe"),
+    ("twilio.com",      "Twilio"),
+    ("sendgrid.net",    "SendGrid"),
+    ("vercel.com",      "Vercel"),
+    ("netlify.com",     "Netlify"),
+    ("supabase.co",     "Supabase"),
+    ("firebase",        "Firebase"),
+    ("amazonaws.com",   "AWS"),
+    ("googleapis.com",  "Google API"),
+    ("google.com",      "Google"),
+    ("cloudflare.com",  "Cloudflare"),
+    ("sentry.io",       "Sentry"),
+    ("mixpanel.com",    "Mixpanel"),
+    ("segment.com",     "Segment"),
+    ("huggingface.co",  "HuggingFace"),
+    ("replicate.com",   "Replicate"),
+]
+
+
+def _label_host(host: str) -> str:
+    """Return a friendly service name for a hostname, or the host itself."""
+    h = host.lower()
+    for fragment, label in KNOWN_APIS:
+        if fragment in h:
+            return label
+    return host
+
+
 def _human_bytes(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if abs(n) < 1024:
@@ -112,10 +149,11 @@ class TimerState:
 class TinaApp:
 
     def __init__(self, root: tk.Tk):
-        self._root     = root
-        self._state    = load_state()
-        self._monitor  = ProcessMonitor()
-        self._folders  = FolderScanner()
+        self._root       = root
+        self._state      = load_state()
+        self._monitor    = ProcessMonitor()
+        self._folders    = FolderScanner()
+        self._ai_monitor = AIMonitor()
 
         # Runtime state
         self._projects:        list = []
@@ -124,6 +162,7 @@ class TinaApp:
         self._ext_conns:       list[str] = []               # external hosts
         self._net_stats:       tuple[str, str] = ("—", "—") # (recv, sent) human strings
         self._net_prev:        Optional[tuple]  = None      # (recv_bytes, sent_bytes, ts)
+        self._ai_events:       list             = []
         self._auto_on          = True
         self._scan_remaining   = REFRESH_S
         self._scanning         = False
@@ -131,8 +170,9 @@ class TinaApp:
         self._pending_recovery: Optional[tuple] = None
 
         # Timers: in-memory, synced to disk every 5 s
-        self._timers:       dict[str, TimerState] = {}
-        self._timer_labels: dict[str, tk.Label]   = {}
+        self._timers:      dict[str, TimerState]  = {}
+        self._timer_vars:  dict[str, tk.StringVar] = {}  # live countdown text
+        self._timer_labels: dict[str, tk.Label]   = {}   # label refs (for color)
 
         self._restore_timers()
         self._setup_window()
@@ -233,8 +273,8 @@ class TinaApp:
         hdr = tk.Frame(self._root, bg=BG)
         hdr.pack(fill="x", padx=24, pady=(16, 0))
 
-        tk.Label(hdr, text="tina", bg=BG, fg=TEXT,
-                 font=("Helvetica Neue", 15)).pack(side="left")
+        tk.Label(hdr, text="TINA", bg=BG, fg=TEXT,
+                 font=("Helvetica Neue", 15, "bold")).pack(side="left")
 
         right = tk.Frame(hdr, bg=BG)
         right.pack(side="right")
@@ -330,6 +370,24 @@ class TinaApp:
                 tk.Label(row, text=text, bg=BG, fg=DIM2, font=F_SM).pack(side="left")
             first = False
 
+    def _timer_action_items(self, name: str, timer, *, notes: bool = True) -> list:
+        """Return action link tuples for the given timer state."""
+        if timer and timer.running:
+            items: list = [
+                ("pause",    lambda n=name: self._pause(n)),
+                ("complete", lambda n=name: self._complete(n)),
+            ]
+        elif timer and not timer.running and timer.remaining < FOCUS_DURATION and not timer.done:
+            items = [
+                ("resume", lambda n=name: self._start(n)),
+                ("reset",  lambda n=name: self._reset(n)),
+            ]
+        else:
+            items = [("focus", lambda n=name: self._start(n))]
+        if notes:
+            items.append(("notes", lambda n=name: self._toggle_notes(n)))
+        return items
+
     # ── Full body render ───────────────────────────────────────────────────────
 
     def _render(self) -> None:
@@ -405,9 +463,9 @@ class TinaApp:
                 self._gap(self._body, 6)
                 tk.Label(self._body, text="External connections",
                          bg=BG, fg=DIM2, font=F_XS).pack(anchor="w", padx=24)
-                for host in self._ext_conns[:8]:
+                for host in self._ext_conns[:10]:
                     tk.Label(self._body, text=f"  {host}", bg=BG, fg=DIM,
-                             font=F_MONO_SM).pack(anchor="w", padx=24)
+                             font=F_SM).pack(anchor="w", padx=24)
 
         self._sep(self._body)
 
@@ -420,8 +478,21 @@ class TinaApp:
         tk.Label(net_row, text=recv, bg=BG, fg=TEXT, font=F_MONO_SM).pack(side="left")
         tk.Label(net_row, text="   ↑ ", bg=BG, fg=AMBER, font=F_SM).pack(side="left")
         tk.Label(net_row, text=sent, bg=BG, fg=TEXT, font=F_MONO_SM).pack(side="left")
-        tk.Label(net_row, text="  (since last scan)", bg=BG, fg=DIM2,
+        tk.Label(net_row, text="  /s since last scan", bg=BG, fg=DIM2,
                  font=F_XS).pack(side="left")
+
+        # AI / browser activity
+        if self._ai_events:
+            self._gap(self._body, 10)
+            tk.Label(self._body, text="AI ACTIVITY", bg=BG, fg=DIM,
+                     font=F_SEC).pack(anchor="w", padx=24, pady=(0, 6))
+            for ev in self._ai_events[:8]:
+                row = tk.Frame(self._body, bg=BG)
+                row.pack(fill="x", padx=24, pady=1)
+                clr = AMBER if ev.is_image else BLUE
+                tk.Label(row, text=ev.source, bg=BG, fg=clr, font=F_SM).pack(side="left")
+                tk.Label(row, text=f"  {ev.event}", bg=BG, fg=DIM, font=F_SM).pack(side="left")
+                tk.Label(row, text=f"  {ev.age}", bg=BG, fg=DIM2, font=F_XS).pack(side="left")
 
         # Settings link
         self._sep(self._body, (20, 8))
@@ -443,35 +514,32 @@ class TinaApp:
             timer = TimerState()
             self._timers[name] = timer
 
+        # Persist StringVar across re-renders so _timer_tick can update without
+        # needing a stale widget reference
+        if name not in self._timer_vars:
+            self._timer_vars[name] = tk.StringVar()
+        var = self._timer_vars[name]
+        var.set(timer.fmt())
+
         frame = tk.Frame(self._body, bg=BG)
         frame.pack(fill="x")
 
-        # Name + countdown on same line
         top = tk.Frame(frame, bg=BG)
         top.pack(fill="x", padx=24)
         tk.Label(top, text=name, bg=BG, fg=TEXT, font=F_MD_B).pack(side="left")
 
-        countdown = tk.Label(top, text=timer.fmt(), bg=BG,
-                             fg=GREEN if timer.running else DIM, font=F_MONO)
+        if timer.running:
+            clr = GREEN
+        elif timer.remaining < FOCUS_DURATION and not timer.done:
+            clr = AMBER
+        else:
+            clr = DIM
+
+        countdown = tk.Label(top, textvariable=var, bg=BG, fg=clr, font=F_MONO)
         countdown.pack(side="right")
         self._timer_labels[name] = countdown
 
-        # Actions
-        if timer.running:
-            actions = [
-                ("pause",    lambda n=name: self._pause(n)),
-                ("complete", lambda n=name: self._complete(n)),
-            ]
-        elif timer.remaining < FOCUS_DURATION and not timer.done:
-            actions = [
-                ("resume", lambda n=name: self._start(n)),
-                ("reset",  lambda n=name: self._reset(n)),
-            ]
-        else:
-            actions = [
-                ("focus", lambda n=name: self._start(n)),
-            ]
-        self._actions(frame, actions)
+        self._actions(frame, self._timer_action_items(name, timer, notes=False))
 
     # ── Recovery banner ────────────────────────────────────────────────────────
 
@@ -493,57 +561,59 @@ class TinaApp:
     def _render_project_row(self, name: str, *,
                             process_state: str = "",
                             pinned: bool = False) -> None:
-        timer    = self._timers.get(name)
-        is_focus = self._state.get("active_focus") == name and timer and timer.running
+        timer = self._timers.get(name)
 
         frame = tk.Frame(self._body, bg=BG)
         frame.pack(fill="x")
 
-        # Status dot
-        if is_focus:
-            dot, dot_fg = "● active", GREEN
-        elif timer and timer.running:
-            dot, dot_fg = "● active", GREEN
+        # Find the scanned project object for extra metadata
+        proj_obj = next((p for p in self._projects if p.name == name), None)
+
+        # Status dot — timer state takes priority over CPU state
+        if timer and timer.running:
+            dot, dot_fg = "● focusing", GREEN
         elif timer and not timer.running and timer.remaining < FOCUS_DURATION:
             dot, dot_fg = "● paused", AMBER
-        elif process_state in ("ACTIVE", "RUNNING"):
+        elif process_state == "ACTIVE":
+            dot, dot_fg = "● active", GREEN
+        elif process_state == "RUNNING":
             dot, dot_fg = "● running", BLUE
         else:
             dot, dot_fg = "· idle", DIM2
 
-        tk.Label(frame, text=dot, bg=BG, fg=dot_fg,
-                 font=F_XS).pack(anchor="w", padx=24)
+        # Status line: dot + editor badge(s)
+        status_row = tk.Frame(frame, bg=BG)
+        status_row.pack(anchor="w", padx=24)
+        tk.Label(status_row, text=dot, bg=BG, fg=dot_fg, font=F_XS).pack(side="left")
+        if proj_obj and proj_obj.editors:
+            for ed in proj_obj.editors:
+                tk.Label(status_row, text=f"  · {ed}", bg=BG, fg=BLUE, font=F_XS).pack(side="left")
 
         # Project name
         tk.Label(frame, text=name, bg=BG, fg=TEXT,
                  font=F_MD_B).pack(anchor="w", padx=24, pady=(2, 0))
 
-        # Timer countdown
+        # Services + task description
+        if proj_obj:
+            if proj_obj.services:
+                svc_text = "  ·  ".join(proj_obj.services)
+                tk.Label(frame, text=svc_text, bg=BG, fg=DIM, font=F_SM).pack(
+                    anchor="w", padx=24)
+            if proj_obj.current_task and proj_obj.current_task != "Development service running":
+                tk.Label(frame, text=proj_obj.current_task, bg=BG, fg=DIM2, font=F_XS).pack(
+                    anchor="w", padx=24)
+            if proj_obj.ports:
+                ports_text = "  ".join(f":{p}" for p in proj_obj.ports[:6])
+                tk.Label(frame, text=ports_text, bg=BG, fg=BLUE, font=F_MONO_SM).pack(
+                    anchor="w", padx=24, pady=(1, 0))
+
+        # Timer countdown (static display — Focus Timers section handles live updates)
         if timer:
             timer_lbl = tk.Label(frame, text=timer.fmt() + " remaining",
                                  bg=BG, fg=DIM, font=F_MONO)
             timer_lbl.pack(anchor="w", padx=24, pady=(2, 0))
-            self._timer_labels[name] = timer_lbl
 
-        # Action links
-        if timer and timer.running:
-            action_items: list[tuple[str, Optional[callable]]] = [
-                ("pause",    lambda n=name: self._pause(n)),
-                ("complete", lambda n=name: self._complete(n)),
-                ("notes",    lambda n=name: self._toggle_notes(n)),
-            ]
-        elif timer and not timer.running and timer.remaining < FOCUS_DURATION:
-            action_items = [
-                ("resume", lambda n=name: self._start(n)),
-                ("reset",  lambda n=name: self._reset(n)),
-                ("notes",  lambda n=name: self._toggle_notes(n)),
-            ]
-        else:
-            action_items = [
-                ("focus", lambda n=name: self._start(n)),
-                ("notes", lambda n=name: self._toggle_notes(n)),
-            ]
-        self._actions(frame, action_items)
+        self._actions(frame, self._timer_action_items(name, timer))
 
         # Inline notes
         if name in self._notes_open:
@@ -573,29 +643,10 @@ class TinaApp:
                  font=F_XS).pack(anchor="w", padx=24)
 
         if timer and timer.remaining < FOCUS_DURATION:
-            lbl = tk.Label(frame, text=timer.fmt() + " remaining",
-                           bg=BG, fg=DIM, font=F_MONO)
-            lbl.pack(anchor="w", padx=24, pady=(2, 0))
-            self._timer_labels[name] = lbl
+            tk.Label(frame, text=timer.fmt() + " remaining",
+                     bg=BG, fg=DIM, font=F_MONO).pack(anchor="w", padx=24, pady=(2, 0))
 
-        if timer and timer.running:
-            actions = [
-                ("pause",    lambda n=name: self._pause(n)),
-                ("complete", lambda n=name: self._complete(n)),
-                ("notes",    lambda n=name: self._toggle_notes(n)),
-            ]
-        elif timer and not timer.running and timer.remaining < FOCUS_DURATION:
-            actions = [
-                ("resume", lambda n=name: self._start(n)),
-                ("reset",  lambda n=name: self._reset(n)),
-                ("notes",  lambda n=name: self._toggle_notes(n)),
-            ]
-        else:
-            actions = [
-                ("focus", lambda n=name: self._start(n)),
-                ("notes", lambda n=name: self._toggle_notes(n)),
-            ]
-        self._actions(frame, actions)
+        self._actions(frame, self._timer_action_items(name, timer))
 
         if name in self._notes_open:
             self._render_notes(frame, name)
@@ -640,9 +691,9 @@ class TinaApp:
         if project not in self._timers:
             self._timers[project] = TimerState()
         t = self._timers[project]
-        if t.remaining <= 0:
+        if t.done or t.remaining <= 0:
             t.remaining = FOCUS_DURATION
-            t.done = False
+        t.done = False   # always clear so pause→resume works after a completed session
         t.running = True
         self._state["active_focus"] = project
         self._sync_timer(project, running=True)
@@ -694,10 +745,10 @@ class TinaApp:
             if timer.tick():
                 self._root.after(0, lambda n=name: self._complete(n))
             elif timer.running:
-                lbl = self._timer_labels.get(name)
-                if lbl:
+                var = self._timer_vars.get(name)
+                if var:
                     try:
-                        lbl.config(text=timer.fmt())
+                        var.set(timer.fmt())
                     except tk.TclError:
                         pass
 
@@ -723,13 +774,6 @@ class TinaApp:
     def _initial_scan(self) -> None:
         self._trigger_scan()
 
-    def _trigger_scan(self) -> None:
-        if self._scanning:
-            return
-        self._scanning       = True
-        self._scan_remaining = REFRESH_S
-        self._status_var.set("scanning…")
-
     def _do_scan(self) -> None:
         try:
             procs    = self._monitor.scan()
@@ -750,9 +794,9 @@ class TinaApp:
             print(f"[TINA] folder scan error: {exc}")
             folders = []
 
-        # Network connections
+        # Network connections — try psutil first, fall back to lsof
         api_ports: list[tuple[int, str]] = []
-        ext_conns: list[str] = []
+        ext_conns: list[str] = []           # friendly-labelled external hosts
         try:
             conns = psutil.net_connections(kind="tcp")
             seen_ports: set[int] = set()
@@ -770,8 +814,49 @@ class TinaApp:
                             seen_hosts.add(ip)
                             ext_conns.append(ip)
         except Exception:
-            pass
+            # lsof fallback — parses LISTEN and ESTABLISHED lines
+            try:
+                r = subprocess.run(
+                    ["lsof", "-i", "TCP", "-n", "-P"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                seen_ports = set()
+                seen_hosts = set()
+                for line in r.stdout.splitlines()[1:]:
+                    parts = line.split()
+                    if len(parts) < 9:
+                        continue
+                    state = parts[-1].strip("()")
+                    addr  = parts[8]
+                    if state == "LISTEN":
+                        try:
+                            port = int(addr.rsplit(":", 1)[-1])
+                            if port not in seen_ports:
+                                seen_ports.add(port)
+                                api_ports.append((port, PORT_NAMES.get(port, "Service")))
+                        except ValueError:
+                            pass
+                    elif state == "ESTABLISHED" and "->" in addr:
+                        remote = addr.split("->")[1]
+                        ip = remote.rsplit(":", 1)[0].strip("[]")
+                        if not ip.startswith(("127.", "::1", "10.", "192.168.", "172.", "fe80", "fd")):
+                            if ip not in seen_hosts:
+                                seen_hosts.add(ip)
+                                ext_conns.append(ip)
+            except Exception:
+                pass
         api_ports.sort(key=lambda x: x[0])
+
+        # Try hostname resolution for external IPs (non-blocking best-effort)
+        import socket
+        labelled_conns: list[str] = []
+        for ip in ext_conns[:12]:
+            try:
+                host = socket.gethostbyaddr(ip)[0]
+                labelled_conns.append(_label_host(host))
+            except Exception:
+                labelled_conns.append(ip)
+        ext_conns = list(dict.fromkeys(labelled_conns))  # deduplicate preserving order
 
         # Network I/O rate
         net_stats = ("—", "—")
@@ -788,17 +873,24 @@ class TinaApp:
         except Exception:
             pass
 
+        # AI / browser activity
+        try:
+            ai_events = self._ai_monitor.scan()
+        except Exception:
+            ai_events = []
+
         self._root.after(0, lambda: self._on_scan_done(
-            projects, folders, api_ports, ext_conns, net_stats))
+            projects, folders, api_ports, ext_conns, net_stats, ai_events))
 
     def _on_scan_done(self, projects: list, folders: list,
                        api_ports: list, ext_conns: list,
-                       net_stats: tuple) -> None:
+                       net_stats: tuple, ai_events: list) -> None:
         self._projects        = projects
         self._folder_projects = folders
         self._api_ports       = api_ports
         self._ext_conns       = ext_conns
         self._net_stats       = net_stats
+        self._ai_events       = ai_events
         self._scanning        = False
 
         project_names = {p.name for p in self._projects}
@@ -814,8 +906,7 @@ class TinaApp:
         self._status_var.set(f"last scan: {ts}")
         self._render()
 
-    # Override _trigger_scan to also launch thread
-    def _trigger_scan(self) -> None:   # noqa: F811
+    def _trigger_scan(self) -> None:
         if self._scanning:
             return
         self._scanning       = True
@@ -873,6 +964,32 @@ class TinaApp:
 
     # ── Dialogs ────────────────────────────────────────────────────────────────
 
+    def _build_radio_group(self, pad, options: list, choice: tk.StringVar) -> None:
+        """Render a list of (value, title, desc) radio options bound to choice."""
+        current = choice.get()
+        dots: dict[str, tk.Label] = {}
+
+        def select(val: str) -> None:
+            choice.set(val)
+            for v, dot in dots.items():
+                dot.config(text="●" if v == val else "○",
+                           fg=GREEN if v == val else DIM)
+
+        for value, title, desc in options:
+            row = tk.Frame(pad, bg=BG)
+            row.pack(anchor="w", pady=3, fill="x")
+            dot = tk.Label(row, text="●" if value == current else "○",
+                           bg=BG, fg=GREEN if value == current else DIM,
+                           font=F_MD, cursor="hand2")
+            dot.pack(side="left", padx=(0, 10))
+            dots[value] = dot
+            col = tk.Frame(row, bg=BG)
+            col.pack(side="left")
+            tk.Label(col, text=title, bg=BG, fg=TEXT, font=F_MD_B, anchor="w").pack(anchor="w")
+            tk.Label(col, text=desc,  bg=BG, fg=DIM,  font=F_XS,  anchor="w").pack(anchor="w")
+            for w in (dot, row, col):
+                w.bind("<Button-1>", lambda _, v=value: select(v))
+
     def _show_first_launch(self) -> None:
         dlg = _Dialog(self._root, "480x400", "Welcome to Tina")
         pad = dlg.pad
@@ -888,39 +1005,14 @@ class TinaApp:
         self._gap(pad, 14)
 
         choice = tk.StringVar(value="always_resume")
-        radio_dots: dict[str, tk.Label] = {}
-
-        options = [
+        self._build_radio_group(pad, [
             ("always_resume",  "Always Resume Tina",
              "Start automatically · resume after sleep/wake"),
             ("ask_after_wake", "Ask Me After Wake",
              "Show a prompt when system wakes"),
             ("manual_only",    "Only Run When Opened",
              "Never launch or resume automatically"),
-        ]
-
-        def select(val: str) -> None:
-            choice.set(val)
-            for v, dot in radio_dots.items():
-                dot.config(text="●" if v == val else "○",
-                           fg=GREEN if v == val else DIM)
-
-        for value, title, desc in options:
-            row = tk.Frame(pad, bg=BG)
-            row.pack(anchor="w", pady=3, fill="x")
-            dot = tk.Label(row, text="●" if value == "always_resume" else "○",
-                           bg=BG,
-                           fg=GREEN if value == "always_resume" else DIM,
-                           font=F_MD, cursor="hand2")
-            dot.pack(side="left", padx=(0, 10))
-            radio_dots[value] = dot
-            col = tk.Frame(row, bg=BG)
-            col.pack(side="left")
-            tk.Label(col, text=title, bg=BG, fg=TEXT, font=F_MD_B, anchor="w").pack(anchor="w")
-            tk.Label(col, text=desc,  bg=BG, fg=DIM, font=F_XS, anchor="w").pack(anchor="w")
-            for w in (dot, row, col):
-                w.bind("<Button-1>", lambda _, v=value: select(v))
-
+        ], choice)
         self._gap(pad, 24)
 
         def on_continue():
@@ -985,41 +1077,17 @@ class TinaApp:
                  bg=BG, fg=TEXT, font=F_MD_B).pack(anchor="w")
         self._gap(pad, 14)
 
-        current = self._state.get("preferences", {}).get("wake_behavior", "ask_after_wake")
-        choice  = tk.StringVar(value=current)
-        radio_dots: dict[str, tk.Label] = {}
-
-        options = [
+        choice = tk.StringVar(
+            value=self._state.get("preferences", {}).get("wake_behavior", "ask_after_wake")
+        )
+        self._build_radio_group(pad, [
             ("always_resume",  "Always Resume Tina",
              "Restore automatically after sleep/wake"),
             ("ask_after_wake", "Ask Me After Wake",
              "Prompt on wake"),
             ("manual_only",    "Only Run When Opened",
              "Never auto-resume"),
-        ]
-
-        def select(val: str) -> None:
-            choice.set(val)
-            for v, dot in radio_dots.items():
-                dot.config(text="●" if v == val else "○",
-                           fg=GREEN if v == val else DIM)
-
-        for value, title, desc in options:
-            row = tk.Frame(pad, bg=BG)
-            row.pack(anchor="w", pady=3, fill="x")
-            dot = tk.Label(row, text="●" if value == current else "○",
-                           bg=BG,
-                           fg=GREEN if value == current else DIM,
-                           font=F_MD, cursor="hand2")
-            dot.pack(side="left", padx=(0, 10))
-            radio_dots[value] = dot
-            col = tk.Frame(row, bg=BG)
-            col.pack(side="left")
-            tk.Label(col, text=title, bg=BG, fg=TEXT, font=F_MD,   anchor="w").pack(anchor="w")
-            tk.Label(col, text=desc,  bg=BG, fg=DIM,  font=F_XS,   anchor="w").pack(anchor="w")
-            for w in (dot, row, col):
-                w.bind("<Button-1>", lambda _, v=value: select(v))
-
+        ], choice)
         self._gap(pad, 20)
 
         def do_save():

@@ -4,6 +4,18 @@ import psutil
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 
+EDITOR_PROCESSES: Dict[str, str] = {
+    'Cursor Helper (Plugin)':    'Cursor',
+    'Cursor Helper (Renderer)':  'Cursor',
+    'Code Helper (Plugin)':      'VS Code',
+    'Code Helper (Renderer)':    'VS Code',
+    'Xcode':                     'Xcode',
+    'WebStorm':                  'WebStorm',
+    'PyCharm':                   'PyCharm',
+    'Nova':                      'Nova',
+    'Zed':                       'Zed',
+}
+
 DEV_PROCESS_NAMES: Dict[str, str] = {
     'node': 'Node.js',
     'npm': 'npm',
@@ -62,6 +74,7 @@ class Project:
     ports: List[int] = field(default_factory=list)
     services: List[str] = field(default_factory=list)
     current_task: str = ""
+    editors: List[str] = field(default_factory=list)
 
 
 class ProcessMonitor:
@@ -157,13 +170,41 @@ class ProcessMonitor:
             groups[key].ports.extend(proc.ports)
             groups[key].services.append(proc.display_name)
 
+        editor_dirs = self._detect_editor_dirs()
         for project in groups.values():
             project.services = sorted(set(project.services))
             project.ports = sorted(set(project.ports))
             project.state = self._determine_state(project)
             project.current_task = self._infer_task(project)
+            project.editors = self._match_editors(project.cwd or '', editor_dirs)
 
         return list(groups.values())
+
+    def _detect_editor_dirs(self) -> Dict[str, set]:
+        """Map editor name → set of cwds it has open (via helper processes)."""
+        result: Dict[str, set] = {}
+        for proc in psutil.process_iter(['name', 'cwd']):
+            try:
+                name = proc.info.get('name') or ''
+                cwd  = proc.info.get('cwd') or ''
+                if not cwd or cwd == '/':
+                    continue
+                editor = EDITOR_PROCESSES.get(name)
+                if editor:
+                    result.setdefault(editor, set()).add(cwd)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return result
+
+    def _match_editors(self, project_cwd: str, editor_dirs: Dict[str, set]) -> List[str]:
+        """Return list of editors that have project_cwd (or a subdir) open."""
+        if not project_cwd:
+            return []
+        matched = []
+        for editor, dirs in editor_dirs.items():
+            if any(d == project_cwd or d.startswith(project_cwd + '/') for d in dirs):
+                matched.append(editor)
+        return sorted(set(matched))
 
     def _determine_state(self, project: Project) -> str:
         if not project.processes:

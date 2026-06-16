@@ -77,15 +77,15 @@ class FolderScanner:
                 self._walk(root, 0, results, seen)
             except (PermissionError, OSError):
                 continue
-            if len(results) >= MAX_RESULTS:
-                break
 
+        # Sort by most-recently-modified, then cap — do NOT cap during the walk
+        # so alphabetically-later folders (e.g. salxir websites) get a fair chance
         results.sort(key=lambda p: p.last_modified, reverse=True)
         return results[:MAX_RESULTS]
 
     def _walk(self, path: Path, depth: int,
               results: list, seen: set) -> None:
-        if depth > MAX_DEPTH or len(results) >= MAX_RESULTS:
+        if depth > MAX_DEPTH:
             return
 
         # Check if this directory is a project root
