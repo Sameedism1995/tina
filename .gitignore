@@ -1,0 +1,12 @@
+Tina.app/
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+*.log
+tina_launch.log
+.tina/
+*.icns
+*.iconset/
+dist/
+build/

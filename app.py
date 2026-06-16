@@ -1,0 +1,922 @@
+#!/usr/bin/env python3
+"""
+app.py — Tina: Personal Development Secretary
+Minimalist Tkinter UI for macOS.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import subprocess
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# ── macOS bundle name ──────────────────────────────────────────────────────────
+try:
+    from Foundation import NSBundle, NSProcessInfo
+    _d = NSBundle.mainBundle().infoDictionary()
+    _d["CFBundleName"] = "Tina"
+    _d["CFBundleDisplayName"] = "Tina"
+    NSProcessInfo.processInfo().setProcessName_("Tina")
+except Exception:
+    pass
+
+import tkinter as tk
+
+try:
+    import psutil  # noqa: F401
+except ImportError:
+    print("[Tina] psutil required: pip install psutil")
+    sys.exit(1)
+
+from monitor       import ProcessMonitor
+from folder_tracker import FolderScanner, FolderProject
+from persistence   import load_state, save_state, append_log
+from wake_monitor  import WakeMonitor
+
+# ── Palette ────────────────────────────────────────────────────────────────────
+BG    = "#111111"
+BG2   = "#191919"
+TEXT  = "#e8e8e8"
+DIM   = "#666666"
+DIM2  = "#333333"
+GREEN = "#4ade80"
+BLUE  = "#60a5fa"
+AMBER = "#fbbf24"
+SEP   = "#222222"
+LINK  = "#888888"
+
+# ── Fonts ──────────────────────────────────────────────────────────────────────
+F_XS   = ("Helvetica Neue", 10)
+F_SM   = ("Helvetica Neue", 11)
+F_MD   = ("Helvetica Neue", 13)
+F_MD_B = ("Helvetica Neue", 13, "bold")
+F_LG   = ("Helvetica Neue", 16, "bold")
+F_SEC  = ("Helvetica Neue", 10)   # section labels (rendered UPPERCASE)
+F_MONO = ("Menlo", 12)
+F_MONO_SM = ("Menlo", 10)
+
+REFRESH_S      = 30
+FOCUS_DURATION = 25 * 60   # seconds
+
+
+# ── Timer state ────────────────────────────────────────────────────────────────
+
+class TimerState:
+    def __init__(self, remaining: int = FOCUS_DURATION, running: bool = False):
+        self.remaining = max(0, remaining)
+        self.running   = running
+        self.done      = remaining <= 0
+
+    def tick(self) -> bool:
+        """Decrement; return True if just hit zero."""
+        if self.running and self.remaining > 0:
+            self.remaining -= 1
+            if self.remaining == 0:
+                self.running = False
+                self.done    = True
+                return True
+        return False
+
+    def fmt(self) -> str:
+        m, s = divmod(max(0, self.remaining), 60)
+        return f"{m:02d}:{s:02d}"
+
+
+# ── Main application ───────────────────────────────────────────────────────────
+
+class TinaApp:
+
+    def __init__(self, root: tk.Tk):
+        self._root     = root
+        self._state    = load_state()
+        self._monitor  = ProcessMonitor()
+        self._folders  = FolderScanner()
+
+        # Runtime state
+        self._projects:        list = []
+        self._folder_projects: list[FolderProject] = []
+        self._auto_on          = True
+        self._scan_remaining   = REFRESH_S
+        self._scanning         = False
+        self._notes_open:      set[str] = set()
+        self._pending_recovery: Optional[tuple] = None   # (project, remaining, elapsed_s)
+
+        # Timers: in-memory, synced to disk every 5 s
+        self._timers:       dict[str, TimerState] = {}
+        self._timer_labels: dict[str, tk.Label]   = {}
+
+        self._restore_timers()
+        self._setup_window()
+        self._build_skeleton()
+
+        # Trigger startup logic after window is drawn
+        self._root.after(100, self._startup)
+
+        # Background threads
+        self._wake_monitor = WakeMonitor(on_wake=self._on_wake)
+        self._wake_monitor.start()
+
+        self._root.after(1000,  self._timer_tick)
+        self._root.after(5000,  self._save_tick)
+        self._root.after(400,   self._initial_scan)
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── Persistence helpers ────────────────────────────────────────────────────
+
+    def _restore_timers(self) -> None:
+        for proj, sess in self._state.get("sessions", {}).items():
+            self._timers[proj] = TimerState(
+                remaining=sess.get("remaining", FOCUS_DURATION),
+                running=False,   # never auto-run on cold load; handled by startup
+            )
+
+    def _sync_timer(self, project: str, *, running: Optional[bool] = None) -> None:
+        """Write in-memory timer back to state dict + save."""
+        sessions = self._state.setdefault("sessions", {})
+        sess     = sessions.setdefault(project, {})
+        timer    = self._timers.get(project)
+        if timer:
+            sess["remaining"] = timer.remaining
+        if running is not None:
+            sess["running"] = running
+        sess["last_active"] = datetime.now().isoformat(timespec="seconds")
+        save_state(self._state)
+
+    # ── Startup / wake / first-launch logic ───────────────────────────────────
+
+    def _startup(self) -> None:
+        prefs = self._state.get("preferences", {})
+
+        if prefs.get("first_launch", True):
+            self._show_first_launch()
+            return
+
+        # Check for elapsed time since last save (restart or sleep)
+        last_save_str  = self._state.get("last_save")
+        active_focus   = self._state.get("active_focus")
+
+        if active_focus and last_save_str:
+            try:
+                last_dt  = datetime.fromisoformat(last_save_str)
+                elapsed  = (datetime.now() - last_dt).total_seconds()
+                if elapsed > 60:
+                    sess         = self._state.get("sessions", {}).get(active_focus, {})
+                    was_running  = sess.get("running", False)
+                    remaining    = sess.get("remaining", FOCUS_DURATION)
+                    if was_running:
+                        new_rem   = max(0, remaining - int(elapsed))
+                        behavior  = prefs.get("wake_behavior", "ask_after_wake")
+                        if behavior == "always_resume":
+                            self._do_resume(active_focus, new_rem)
+                            self._pending_recovery = (active_focus, new_rem, int(elapsed))
+                            append_log(self._state, "Restoring session")
+                        elif behavior == "ask_after_wake":
+                            self._root.after(
+                                300,
+                                lambda: self._show_wake_prompt(active_focus, new_rem, int(elapsed)),
+                            )
+            except Exception as exc:
+                print(f"[TINA] startup check error: {exc}")
+
+    def _do_resume(self, project: str, remaining: int) -> None:
+        if project not in self._timers:
+            self._timers[project] = TimerState()
+        t = self._timers[project]
+        t.remaining = remaining
+        t.running   = True
+        t.done      = False
+        self._state["active_focus"] = project
+        append_log(self._state, f"Focus resumed: {project}")
+
+    # ── Window ─────────────────────────────────────────────────────────────────
+
+    def _setup_window(self) -> None:
+        r = self._root
+        r.title("Tina")
+        r.configure(bg=BG)
+        r.geometry("500x720+120+80")
+        r.minsize(420, 500)
+
+    # ── Skeleton (static frame structure) ─────────────────────────────────────
+
+    def _build_skeleton(self) -> None:
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = tk.Frame(self._root, bg=BG)
+        hdr.pack(fill="x", padx=24, pady=(16, 0))
+
+        tk.Label(hdr, text="tina", bg=BG, fg=TEXT,
+                 font=("Helvetica Neue", 15)).pack(side="left")
+
+        right = tk.Frame(hdr, bg=BG)
+        right.pack(side="right")
+
+        self._auto_lbl = tk.Label(
+            right, text="auto: on", bg=BG, fg=GREEN, font=F_SM, cursor="hand2"
+        )
+        self._auto_lbl.pack(side="left")
+        self._auto_lbl.bind("<Button-1>", lambda _: self._toggle_auto())
+        _hover(self._auto_lbl, TEXT, lambda: GREEN if self._auto_on else DIM)
+
+        tk.Label(right, text="  ·  ", bg=BG, fg=DIM2, font=F_SM).pack(side="left")
+
+        ref = tk.Label(right, text="refresh", bg=BG, fg=LINK, font=F_SM, cursor="hand2")
+        ref.pack(side="left")
+        ref.bind("<Button-1>", lambda _: self._trigger_scan())
+        _hover(ref, TEXT, lambda: LINK)
+
+        # Scan status line
+        self._status_var = tk.StringVar(value="")
+        tk.Label(self._root, textvariable=self._status_var,
+                 bg=BG, fg=DIM, font=F_XS).pack(anchor="w", padx=24, pady=(3, 8))
+
+        # Thin separator
+        tk.Frame(self._root, bg=SEP, height=1).pack(fill="x")
+
+        # ── Scrollable body ───────────────────────────────────────────────────
+        self._canvas = tk.Canvas(self._root, bg=BG, highlightthickness=0, bd=0)
+        self._canvas.pack(fill="both", expand=True)
+
+        self._body = tk.Frame(self._canvas, bg=BG)
+        self._win_id = self._canvas.create_window((0, 0), window=self._body, anchor="nw")
+
+        self._body.bind("<Configure>",
+                        lambda _: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>",
+                          lambda e: self._canvas.itemconfig(self._win_id, width=e.width))
+        self._root.bind_all("<MouseWheel>", self._on_scroll)
+        self._root.bind_all("<Button-4>",   self._on_scroll)
+        self._root.bind_all("<Button-5>",   self._on_scroll)
+
+    def _on_scroll(self, e: tk.Event) -> None:
+        if getattr(e, "delta", 0):
+            self._canvas.yview_scroll(-1 * (e.delta // 120), "units")
+        elif e.num == 4:
+            self._canvas.yview_scroll(-1, "units")
+        elif e.num == 5:
+            self._canvas.yview_scroll(1, "units")
+
+    # ── Widget micro-helpers ───────────────────────────────────────────────────
+
+    def _lbl(self, parent, text="", fg=TEXT, font=F_MD, **kw) -> tk.Label:
+        return tk.Label(parent, text=text, bg=BG, fg=fg, font=font, **kw)
+
+    def _link(self, parent, text: str, cmd, fg: str = LINK, font=F_SM) -> tk.Label:
+        lbl = tk.Label(parent, text=text, bg=BG, fg=fg, font=font, cursor="hand2")
+        lbl.bind("<Button-1>", lambda _: cmd())
+        _hover(lbl, TEXT, lambda: fg)
+        return lbl
+
+    def _sep(self, parent, vpad=(16, 16)) -> None:
+        tk.Frame(parent, bg=BG, height=vpad[0]).pack(fill="x")
+        tk.Frame(parent, bg=SEP, height=1).pack(fill="x")
+        tk.Frame(parent, bg=BG, height=vpad[1]).pack(fill="x")
+
+    def _section(self, parent, title: str) -> None:
+        tk.Label(parent, text=title.upper(), bg=BG, fg=DIM,
+                 font=F_SEC).pack(anchor="w", padx=24, pady=(0, 10))
+
+    def _gap(self, parent, h: int) -> None:
+        tk.Frame(parent, bg=BG, height=h).pack(fill="x")
+
+    # ── Actions row helper ─────────────────────────────────────────────────────
+
+    def _actions(self, parent, items: list[tuple[str, Optional[callable]]]) -> None:
+        """Render action links separated by ·  items = [(label, cmd|None)]."""
+        row = tk.Frame(parent, bg=BG)
+        row.pack(anchor="w", padx=24, pady=(4, 0))
+        first = True
+        for text, cmd in items:
+            if not first:
+                tk.Label(row, text=" · ", bg=BG, fg=DIM2, font=F_SM).pack(side="left")
+            if cmd:
+                self._link(row, text, cmd, fg=LINK).pack(side="left")
+            else:
+                tk.Label(row, text=text, bg=BG, fg=DIM2, font=F_SM).pack(side="left")
+            first = False
+
+    # ── Full body render ───────────────────────────────────────────────────────
+
+    def _render(self) -> None:
+        for w in self._body.winfo_children():
+            w.destroy()
+        self._timer_labels.clear()
+
+        self._gap(self._body, 20)
+
+        # Recovery banner (shown once after resume from sleep/restart)
+        if self._pending_recovery:
+            self._render_recovery(*self._pending_recovery)
+            self._pending_recovery = None
+            self._sep(self._body, (16, 16))
+
+        # CURRENT FOCUS (pinned)
+        active = self._state.get("active_focus")
+        if active and self._timers.get(active, TimerState(running=False)).running:
+            self._section(self._body, "Current Focus")
+            self._render_project_row(active, pinned=True)
+            self._sep(self._body)
+
+        # PROJECTS (running processes, excluding active focus)
+        others = [p for p in self._projects if p.name != active]
+        if others:
+            self._section(self._body, "Projects")
+            for i, proj in enumerate(others):
+                self._render_project_row(proj.name, process_state=proj.state)
+                if i < len(others) - 1:
+                    self._gap(self._body, 16)
+
+        # TRACKED FOLDERS (not already shown as running projects)
+        running_names = {p.name for p in self._projects}
+        new_folders = [f for f in self._folder_projects if f.name not in running_names]
+        if new_folders:
+            if others or (active and self._timers.get(active, TimerState()).running):
+                self._sep(self._body)
+            self._section(self._body, "Tracked Folders")
+            for i, f in enumerate(new_folders):
+                self._render_folder_row(f)
+                if i < len(new_folders) - 1:
+                    self._gap(self._body, 14)
+
+        # Empty state
+        if not self._projects and not self._folder_projects:
+            self._gap(self._body, 12)
+            tk.Label(self._body, text="Nothing running.",
+                     bg=BG, fg=DIM, font=F_MD).pack(anchor="w", padx=24)
+            tk.Label(self._body, text="Start a project and it will appear here.",
+                     bg=BG, fg=DIM2, font=F_SM).pack(anchor="w", padx=24, pady=(2, 0))
+
+        # LOG
+        log = self._state.get("log", [])
+        if log:
+            self._sep(self._body)
+            self._section(self._body, "Log")
+            for entry in log[:10]:
+                row = tk.Frame(self._body, bg=BG)
+                row.pack(fill="x", padx=24, pady=1)
+                tk.Label(row, text=f"[TINA] {entry['event']}",
+                         bg=BG, fg=DIM, font=F_MONO_SM, anchor="w").pack(side="left")
+                tk.Label(row, text=entry["ts"],
+                         bg=BG, fg=DIM2, font=F_MONO_SM).pack(side="right")
+
+        # Settings link
+        self._sep(self._body, (20, 8))
+        settings_row = tk.Frame(self._body, bg=BG)
+        settings_row.pack(fill="x", padx=24)
+        self._link(settings_row, "settings", self._show_settings, fg=DIM2).pack(side="left")
+
+        self._gap(self._body, 28)
+
+    # ── Recovery banner ────────────────────────────────────────────────────────
+
+    def _render_recovery(self, project: str, remaining: int, elapsed: int) -> None:
+        pad = tk.Frame(self._body, bg=BG)
+        pad.pack(fill="x", padx=24)
+        tk.Label(pad, text="Welcome back.", bg=BG, fg=TEXT,
+                 font=("Helvetica Neue", 15, "bold"), anchor="w").pack(anchor="w")
+        self._gap(pad, 4)
+        tk.Label(pad, text=f"Last active project:", bg=BG, fg=DIM, font=F_SM).pack(anchor="w")
+        tk.Label(pad, text=project, bg=BG, fg=TEXT, font=F_MD_B).pack(anchor="w", pady=(2, 0))
+        if remaining > 0:
+            m, s = divmod(remaining, 60)
+            tk.Label(pad, text=f"{m:02d}:{s:02d} remaining.",
+                     bg=BG, fg=DIM, font=F_MONO).pack(anchor="w", pady=(2, 0))
+
+    # ── Project row ────────────────────────────────────────────────────────────
+
+    def _render_project_row(self, name: str, *,
+                            process_state: str = "",
+                            pinned: bool = False) -> None:
+        timer    = self._timers.get(name)
+        is_focus = self._state.get("active_focus") == name and timer and timer.running
+
+        frame = tk.Frame(self._body, bg=BG)
+        frame.pack(fill="x")
+
+        # Status dot
+        if is_focus:
+            dot, dot_fg = "● active", GREEN
+        elif timer and timer.running:
+            dot, dot_fg = "● active", GREEN
+        elif timer and not timer.running and timer.remaining < FOCUS_DURATION:
+            dot, dot_fg = "● paused", AMBER
+        elif process_state in ("ACTIVE", "RUNNING"):
+            dot, dot_fg = "● running", BLUE
+        else:
+            dot, dot_fg = "· idle", DIM2
+
+        tk.Label(frame, text=dot, bg=BG, fg=dot_fg,
+                 font=F_XS).pack(anchor="w", padx=24)
+
+        # Project name
+        tk.Label(frame, text=name, bg=BG, fg=TEXT,
+                 font=F_MD_B).pack(anchor="w", padx=24, pady=(2, 0))
+
+        # Timer countdown
+        if timer:
+            timer_lbl = tk.Label(frame, text=timer.fmt() + " remaining",
+                                 bg=BG, fg=DIM, font=F_MONO)
+            timer_lbl.pack(anchor="w", padx=24, pady=(2, 0))
+            self._timer_labels[name] = timer_lbl
+
+        # Action links
+        if timer and timer.running:
+            action_items: list[tuple[str, Optional[callable]]] = [
+                ("pause",    lambda n=name: self._pause(n)),
+                ("complete", lambda n=name: self._complete(n)),
+                ("notes",    lambda n=name: self._toggle_notes(n)),
+            ]
+        elif timer and not timer.running and timer.remaining < FOCUS_DURATION:
+            action_items = [
+                ("resume", lambda n=name: self._start(n)),
+                ("reset",  lambda n=name: self._reset(n)),
+                ("notes",  lambda n=name: self._toggle_notes(n)),
+            ]
+        else:
+            action_items = [
+                ("focus", lambda n=name: self._start(n)),
+                ("notes", lambda n=name: self._toggle_notes(n)),
+            ]
+        self._actions(frame, action_items)
+
+        # Inline notes
+        if name in self._notes_open:
+            self._render_notes(frame, name)
+
+    # ── Folder row ─────────────────────────────────────────────────────────────
+
+    def _render_folder_row(self, f: FolderProject) -> None:
+        name  = f.name
+        timer = self._timers.get(name)
+        frame = tk.Frame(self._body, bg=BG)
+        frame.pack(fill="x")
+
+        tk.Label(frame, text="· idle", bg=BG, fg=DIM2,
+                 font=F_XS).pack(anchor="w", padx=24)
+
+        # Name + branch
+        name_row = tk.Frame(frame, bg=BG)
+        name_row.pack(anchor="w", padx=24, pady=(2, 0))
+        tk.Label(name_row, text=name, bg=BG, fg=TEXT,
+                 font=F_MD_B).pack(side="left")
+        if f.git_branch:
+            tk.Label(name_row, text=f"  {f.git_branch}",
+                     bg=BG, fg=DIM, font=F_SM).pack(side="left")
+
+        tk.Label(frame, text=f.project_type, bg=BG, fg=DIM2,
+                 font=F_XS).pack(anchor="w", padx=24)
+
+        if timer and timer.remaining < FOCUS_DURATION:
+            lbl = tk.Label(frame, text=timer.fmt() + " remaining",
+                           bg=BG, fg=DIM, font=F_MONO)
+            lbl.pack(anchor="w", padx=24, pady=(2, 0))
+            self._timer_labels[name] = lbl
+
+        if timer and timer.running:
+            actions = [
+                ("pause",    lambda n=name: self._pause(n)),
+                ("complete", lambda n=name: self._complete(n)),
+                ("notes",    lambda n=name: self._toggle_notes(n)),
+            ]
+        elif timer and not timer.running and timer.remaining < FOCUS_DURATION:
+            actions = [
+                ("resume", lambda n=name: self._start(n)),
+                ("reset",  lambda n=name: self._reset(n)),
+                ("notes",  lambda n=name: self._toggle_notes(n)),
+            ]
+        else:
+            actions = [
+                ("focus", lambda n=name: self._start(n)),
+                ("notes", lambda n=name: self._toggle_notes(n)),
+            ]
+        self._actions(frame, actions)
+
+        if name in self._notes_open:
+            self._render_notes(frame, name)
+
+    # ── Inline notes ───────────────────────────────────────────────────────────
+
+    def _render_notes(self, parent: tk.Frame, project: str) -> None:
+        content = (self._state.get("sessions", {})
+                   .get(project, {})
+                   .get("notes", ""))
+        txt = tk.Text(
+            parent,
+            bg=BG2, fg=TEXT, insertbackground=TEXT,
+            bd=0, highlightthickness=1,
+            highlightbackground=DIM2, highlightcolor=DIM,
+            relief="flat", font=F_SM,
+            wrap="word", height=4,
+            padx=12, pady=10, spacing1=2, spacing3=2,
+        )
+        txt.pack(fill="x", padx=24, pady=(6, 0))
+        txt.insert("1.0", content or "")
+
+        def _save(_event=None):
+            val = txt.get("1.0", "end-1c")
+            (self._state
+             .setdefault("sessions", {})
+             .setdefault(project, {})
+             )["notes"] = val
+            save_state(self._state)
+
+        txt.bind("<KeyRelease>", _save)
+
+    # ── Timer actions ──────────────────────────────────────────────────────────
+
+    def _start(self, project: str) -> None:
+        # Pause any other running focus
+        current = self._state.get("active_focus")
+        if current and current != project and current in self._timers:
+            self._timers[current].running = False
+            self._sync_timer(current, running=False)
+
+        if project not in self._timers:
+            self._timers[project] = TimerState()
+        t = self._timers[project]
+        if t.remaining <= 0:
+            t.remaining = FOCUS_DURATION
+            t.done = False
+        t.running = True
+        self._state["active_focus"] = project
+        self._sync_timer(project, running=True)
+        append_log(self._state, f"Focus started: {project}")
+        self._render()
+
+    def _pause(self, project: str) -> None:
+        if project in self._timers:
+            self._timers[project].running = False
+        self._state["active_focus"] = None
+        self._sync_timer(project, running=False)
+        append_log(self._state, f"Focus paused: {project}")
+        self._render()
+
+    def _complete(self, project: str) -> None:
+        if project in self._timers:
+            t = self._timers[project]
+            t.running   = False
+            t.remaining = FOCUS_DURATION
+            t.done      = True
+        self._state["active_focus"] = None
+        self._sync_timer(project, running=False)
+        append_log(self._state, f"Focus complete: {project}")
+        self._render()
+        self._notify(project, "Focus session complete")
+
+    def _reset(self, project: str) -> None:
+        if project in self._timers:
+            t = self._timers[project]
+            t.remaining = FOCUS_DURATION
+            t.running   = False
+            t.done      = False
+        if self._state.get("active_focus") == project:
+            self._state["active_focus"] = None
+        self._sync_timer(project, running=False)
+        self._render()
+
+    def _toggle_notes(self, project: str) -> None:
+        if project in self._notes_open:
+            self._notes_open.discard(project)
+        else:
+            self._notes_open.add(project)
+        self._render()
+
+    # ── Timer tick — 1 Hz, in-place label updates ──────────────────────────────
+
+    def _timer_tick(self) -> None:
+        for name, timer in list(self._timers.items()):
+            if timer.tick():
+                self._root.after(0, lambda n=name: self._complete(n))
+            elif timer.running:
+                lbl = self._timer_labels.get(name)
+                if lbl:
+                    try:
+                        lbl.config(text=timer.fmt() + " remaining")
+                    except tk.TclError:
+                        pass
+
+        # Update scan countdown
+        if self._auto_on and not self._scanning:
+            self._scan_remaining -= 1
+            if self._scan_remaining <= 0:
+                self._trigger_scan()
+            else:
+                self._status_var.set(f"next scan: {self._scan_remaining}s")
+
+        self._root.after(1000, self._timer_tick)
+
+    # ── State save tick — every 5 s ────────────────────────────────────────────
+
+    def _save_tick(self) -> None:
+        for name, timer in self._timers.items():
+            self._sync_timer(name, running=timer.running)
+        self._root.after(5000, self._save_tick)
+
+    # ── Scanning ───────────────────────────────────────────────────────────────
+
+    def _initial_scan(self) -> None:
+        self._trigger_scan()
+
+    def _trigger_scan(self) -> None:
+        if self._scanning:
+            return
+        self._scanning       = True
+        self._scan_remaining = REFRESH_S
+        self._status_var.set("scanning…")
+
+    def _do_scan(self) -> None:
+        try:
+            procs    = self._monitor.scan()
+            projects = self._monitor.group_into_projects(procs)
+        except Exception as exc:
+            print(f"[TINA] scan error: {exc}")
+            projects = []
+        try:
+            folders = self._folders.scan()
+        except Exception as exc:
+            print(f"[TINA] folder scan error: {exc}")
+            folders = []
+        self._root.after(0, lambda: self._on_scan_done(projects, folders))
+
+    def _on_scan_done(self, projects: list, folders: list) -> None:
+        self._projects        = projects
+        self._folder_projects = folders
+        self._scanning        = False
+
+        # Ensure every detected project has a timer slot
+        for p in self._projects:
+            if p.name not in self._timers:
+                self._timers[p.name] = TimerState()
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._status_var.set(f"last scan: {ts}")
+        append_log(self._state, "Project scan completed")
+        self._render()
+
+    # Override _trigger_scan to also launch thread
+    def _trigger_scan(self) -> None:   # noqa: F811
+        if self._scanning:
+            return
+        self._scanning       = True
+        self._scan_remaining = REFRESH_S
+        self._status_var.set("scanning…")
+        threading.Thread(target=self._do_scan, daemon=True).start()
+
+    def _toggle_auto(self) -> None:
+        self._auto_on = not self._auto_on
+        if self._auto_on:
+            self._auto_lbl.config(text="auto: on",  fg=GREEN)
+            self._scan_remaining = REFRESH_S
+        else:
+            self._auto_lbl.config(text="auto: off", fg=DIM)
+
+    # ── Wake handling ──────────────────────────────────────────────────────────
+
+    def _on_wake(self, sleep_secs: float) -> None:
+        """Called on wake-monitor thread — dispatch to main thread."""
+        self._root.after(0, lambda: self._handle_wake(sleep_secs))
+
+    def _handle_wake(self, sleep_secs: float) -> None:
+        mins = int(sleep_secs / 60)
+        append_log(self._state, f"System awake (slept ~{mins}m)")
+
+        active   = self._state.get("active_focus")
+        behavior = self._state.get("preferences", {}).get("wake_behavior", "ask_after_wake")
+        timer    = self._timers.get(active) if active else None
+
+        if active and timer and timer.running:
+            elapsed  = int(sleep_secs)
+            new_rem  = max(0, timer.remaining - elapsed)
+            if behavior == "always_resume":
+                timer.remaining = new_rem
+                append_log(self._state, "Restoring session")
+                self._trigger_scan()
+            elif behavior == "ask_after_wake":
+                timer.running = False
+                self._show_wake_prompt(active, new_rem, elapsed)
+        else:
+            if behavior != "manual_only":
+                self._trigger_scan()
+
+    # ── macOS notification ─────────────────────────────────────────────────────
+
+    def _notify(self, subtitle: str, message: str) -> None:
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{message}" with title "Tina" subtitle "{subtitle}"'],
+                check=False, capture_output=True,
+            )
+        except Exception:
+            pass
+
+    # ── Dialogs ────────────────────────────────────────────────────────────────
+
+    def _show_first_launch(self) -> None:
+        dlg = _Dialog(self._root, "480x400", "Welcome to Tina")
+        pad = dlg.pad
+
+        tk.Label(pad, text="Welcome to Tina", bg=BG, fg=TEXT,
+                 font=("Helvetica Neue", 20, "bold")).pack(anchor="w")
+        self._gap(pad, 6)
+        tk.Label(pad, text="Your personal development secretary.",
+                 bg=BG, fg=DIM, font=F_MD).pack(anchor="w")
+        self._gap(pad, 24)
+        tk.Label(pad, text="How would you like Tina to behave?",
+                 bg=BG, fg=TEXT, font=F_MD).pack(anchor="w")
+        self._gap(pad, 14)
+
+        choice = tk.StringVar(value="always_resume")
+        radio_dots: dict[str, tk.Label] = {}
+
+        options = [
+            ("always_resume",  "Always Resume Tina",
+             "Start automatically · resume after sleep/wake"),
+            ("ask_after_wake", "Ask Me After Wake",
+             "Show a prompt when system wakes"),
+            ("manual_only",    "Only Run When Opened",
+             "Never launch or resume automatically"),
+        ]
+
+        def select(val: str) -> None:
+            choice.set(val)
+            for v, dot in radio_dots.items():
+                dot.config(text="●" if v == val else "○",
+                           fg=GREEN if v == val else DIM)
+
+        for value, title, desc in options:
+            row = tk.Frame(pad, bg=BG)
+            row.pack(anchor="w", pady=3, fill="x")
+            dot = tk.Label(row, text="●" if value == "always_resume" else "○",
+                           bg=BG,
+                           fg=GREEN if value == "always_resume" else DIM,
+                           font=F_MD, cursor="hand2")
+            dot.pack(side="left", padx=(0, 10))
+            radio_dots[value] = dot
+            col = tk.Frame(row, bg=BG)
+            col.pack(side="left")
+            tk.Label(col, text=title, bg=BG, fg=TEXT, font=F_MD_B, anchor="w").pack(anchor="w")
+            tk.Label(col, text=desc,  bg=BG, fg=DIM, font=F_XS, anchor="w").pack(anchor="w")
+            for w in (dot, row, col):
+                w.bind("<Button-1>", lambda _, v=value: select(v))
+
+        self._gap(pad, 24)
+
+        def on_continue():
+            self._state["preferences"]["wake_behavior"] = choice.get()
+            self._state["preferences"]["first_launch"]  = False
+            save_state(self._state)
+            append_log(self._state, f"Setup: {choice.get()}")
+            dlg.destroy()
+            self._trigger_scan()
+
+        cont = tk.Label(pad, text="Continue  →", bg=BG, fg=TEXT,
+                        font=F_MD_B, cursor="hand2")
+        cont.pack(anchor="w")
+        cont.bind("<Button-1>", lambda _: on_continue())
+        _hover(cont, GREEN, lambda: TEXT)
+
+    def _show_wake_prompt(self, project: str, remaining: int, elapsed: int) -> None:
+        dlg = _Dialog(self._root, "400x260", "Resume monitoring?")
+        pad = dlg.pad
+
+        tk.Label(pad, text="Resume Tina monitoring?", bg=BG, fg=TEXT,
+                 font=("Helvetica Neue", 15, "bold")).pack(anchor="w")
+        self._gap(pad, 8)
+        tk.Label(pad, text=f"Last active: {project}",
+                 bg=BG, fg=DIM, font=F_MD).pack(anchor="w")
+        if remaining > 0:
+            m, s = divmod(remaining, 60)
+            tk.Label(pad, text=f"{m:02d}:{s:02d} remaining",
+                     bg=BG, fg=DIM, font=F_MONO).pack(anchor="w", pady=(2, 0))
+
+        self._gap(pad, 24)
+        row = tk.Frame(pad, bg=BG)
+        row.pack(anchor="w")
+
+        def do_resume():
+            self._do_resume(project, remaining)
+            dlg.destroy()
+            self._trigger_scan()
+
+        def do_dismiss():
+            append_log(self._state, "Wake prompt dismissed")
+            dlg.destroy()
+            self._trigger_scan()
+
+        res = tk.Label(row, text="Resume", bg=BG, fg=GREEN, font=F_MD_B, cursor="hand2")
+        res.pack(side="left")
+        res.bind("<Button-1>", lambda _: do_resume())
+        _hover(res, TEXT, lambda: GREEN)
+
+        tk.Label(row, text="   ", bg=BG).pack(side="left")
+
+        dis = tk.Label(row, text="Not Now", bg=BG, fg=DIM, font=F_MD, cursor="hand2")
+        dis.pack(side="left")
+        dis.bind("<Button-1>", lambda _: do_dismiss())
+        _hover(dis, TEXT, lambda: DIM)
+
+    def _show_settings(self) -> None:
+        dlg = _Dialog(self._root, "420x340", "Settings")
+        pad = dlg.pad
+
+        tk.Label(pad, text="Keep Tina Running",
+                 bg=BG, fg=TEXT, font=F_MD_B).pack(anchor="w")
+        self._gap(pad, 14)
+
+        current = self._state.get("preferences", {}).get("wake_behavior", "ask_after_wake")
+        choice  = tk.StringVar(value=current)
+        radio_dots: dict[str, tk.Label] = {}
+
+        options = [
+            ("always_resume",  "Always Resume Tina",
+             "Restore automatically after sleep/wake"),
+            ("ask_after_wake", "Ask Me After Wake",
+             "Prompt on wake"),
+            ("manual_only",    "Only Run When Opened",
+             "Never auto-resume"),
+        ]
+
+        def select(val: str) -> None:
+            choice.set(val)
+            for v, dot in radio_dots.items():
+                dot.config(text="●" if v == val else "○",
+                           fg=GREEN if v == val else DIM)
+
+        for value, title, desc in options:
+            row = tk.Frame(pad, bg=BG)
+            row.pack(anchor="w", pady=3, fill="x")
+            dot = tk.Label(row, text="●" if value == current else "○",
+                           bg=BG,
+                           fg=GREEN if value == current else DIM,
+                           font=F_MD, cursor="hand2")
+            dot.pack(side="left", padx=(0, 10))
+            radio_dots[value] = dot
+            col = tk.Frame(row, bg=BG)
+            col.pack(side="left")
+            tk.Label(col, text=title, bg=BG, fg=TEXT, font=F_MD,   anchor="w").pack(anchor="w")
+            tk.Label(col, text=desc,  bg=BG, fg=DIM,  font=F_XS,   anchor="w").pack(anchor="w")
+            for w in (dot, row, col):
+                w.bind("<Button-1>", lambda _, v=value: select(v))
+
+        self._gap(pad, 20)
+
+        def do_save():
+            self._state.setdefault("preferences", {})["wake_behavior"] = choice.get()
+            save_state(self._state)
+            dlg.destroy()
+
+        sv = tk.Label(pad, text="Save", bg=BG, fg=TEXT, font=F_MD_B, cursor="hand2")
+        sv.pack(anchor="w")
+        sv.bind("<Button-1>", lambda _: do_save())
+        _hover(sv, GREEN, lambda: TEXT)
+
+    # ── Cleanup ────────────────────────────────────────────────────────────────
+
+    def _on_close(self) -> None:
+        append_log(self._state, "Tina closed")
+        for name, timer in self._timers.items():
+            self._sync_timer(name, running=timer.running)
+        self._wake_monitor.stop()
+        self._root.destroy()
+
+
+# ── Utility: dialog window ─────────────────────────────────────────────────────
+
+class _Dialog:
+    def __init__(self, root: tk.Tk, geometry: str, title: str):
+        self._win = tk.Toplevel(root)
+        self._win.title("")
+        self._win.configure(bg=BG)
+        self._win.geometry(geometry)
+        self._win.resizable(False, False)
+        self._win.grab_set()
+        self._win.lift()
+        self.pad = tk.Frame(self._win, bg=BG)
+        self.pad.pack(fill="both", expand=True, padx=36, pady=36)
+
+    def destroy(self):
+        self._win.destroy()
+
+
+# ── Utility: hover effect ──────────────────────────────────────────────────────
+
+def _hover(lbl: tk.Label, enter_fg: str, leave_fg_fn) -> None:
+    lbl.bind("<Enter>", lambda _: lbl.config(fg=enter_fg))
+    lbl.bind("<Leave>", lambda _: lbl.config(fg=leave_fg_fn()))
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main():
+    root = tk.Tk()
+    TinaApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
