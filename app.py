@@ -370,7 +370,7 @@ class TinaApp:
                 tk.Label(row, text=text, bg=BG, fg=DIM2, font=F_SM).pack(side="left")
             first = False
 
-    def _timer_action_items(self, name: str, timer, *, notes: bool = True) -> list:
+    def _timer_action_items(self, name: str, timer, *, notes: bool = False) -> list:
         """Return action link tuples for the given timer state."""
         if timer and timer.running:
             items: list = [
@@ -615,10 +615,6 @@ class TinaApp:
 
         self._actions(frame, self._timer_action_items(name, timer))
 
-        # Inline notes
-        if name in self._notes_open:
-            self._render_notes(frame, name)
-
     # ── Folder row ─────────────────────────────────────────────────────────────
 
     def _render_folder_row(self, f: FolderProject) -> None:
@@ -647,9 +643,6 @@ class TinaApp:
                      bg=BG, fg=DIM, font=F_MONO).pack(anchor="w", padx=24, pady=(2, 0))
 
         self._actions(frame, self._timer_action_items(name, timer))
-
-        if name in self._notes_open:
-            self._render_notes(frame, name)
 
     # ── Inline notes ───────────────────────────────────────────────────────────
 
