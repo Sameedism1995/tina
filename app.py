@@ -253,12 +253,19 @@ class TinaApp:
         self._root.bind_all("<Button-5>",   self._on_scroll)
 
     def _on_scroll(self, e: tk.Event) -> None:
-        if getattr(e, "delta", 0):
-            self._canvas.yview_scroll(-1 * (e.delta // 120), "units")
-        elif e.num == 4:
+        if e.num == 4:
             self._canvas.yview_scroll(-1, "units")
         elif e.num == 5:
             self._canvas.yview_scroll(1, "units")
+        else:
+            d = getattr(e, "delta", 0)
+            if abs(d) >= 120:
+                # Traditional mouse wheel: 120 units per click
+                self._canvas.yview_scroll(-(d // 120), "units")
+            elif d > 0:
+                self._canvas.yview_scroll(-1, "units")
+            elif d < 0:
+                self._canvas.yview_scroll(1, "units")
 
     # ── Widget micro-helpers ───────────────────────────────────────────────────
 
