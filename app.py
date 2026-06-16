@@ -28,15 +28,15 @@ except Exception:
 import tkinter as tk
 
 try:
-    import psutil  # noqa: F401
+    import psutil
 except ImportError:
     print("[Tina] psutil required: pip install psutil")
     sys.exit(1)
 
-from monitor       import ProcessMonitor
+from monitor        import ProcessMonitor
 from folder_tracker import FolderScanner, FolderProject
-from persistence   import load_state, save_state, append_log
-from wake_monitor  import WakeMonitor
+from persistence    import load_state, save_state, append_log
+from wake_monitor   import WakeMonitor
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 BG    = "#111111"
@@ -62,6 +62,26 @@ F_MONO_SM = ("Menlo", 10)
 
 REFRESH_S      = 30
 FOCUS_DURATION = 25 * 60   # seconds
+
+# Port → service name
+PORT_NAMES: dict[int, str] = {
+    3000: "Dev Server", 3001: "Dev Server", 3002: "Dev Server",
+    4000: "Dev Server", 4200: "Angular",    4321: "Astro",
+    5000: "Flask",      5001: "Dev Server", 5173: "Vite",
+    8000: "Django",     8080: "HTTP",       8443: "HTTPS Dev",
+    8888: "Jupyter",    9000: "Dev Server",
+    5432: "PostgreSQL", 3306: "MySQL",      27017: "MongoDB",
+    6379: "Redis",      5672: "RabbitMQ",   9200: "Elasticsearch",
+    1433: "SQL Server", 5984: "CouchDB",    9092: "Kafka",
+}
+
+
+def _human_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 
 # ── Timer state ────────────────────────────────────────────────────────────────
@@ -100,11 +120,15 @@ class TinaApp:
         # Runtime state
         self._projects:        list = []
         self._folder_projects: list[FolderProject] = []
+        self._api_ports:       list[tuple[int, str]] = []   # (port, service)
+        self._ext_conns:       list[str] = []               # external hosts
+        self._net_stats:       tuple[str, str] = ("—", "—") # (recv, sent) human strings
+        self._net_prev:        Optional[tuple]  = None      # (recv_bytes, sent_bytes, ts)
         self._auto_on          = True
         self._scan_remaining   = REFRESH_S
         self._scanning         = False
         self._notes_open:      set[str] = set()
-        self._pending_recovery: Optional[tuple] = None   # (project, remaining, elapsed_s)
+        self._pending_recovery: Optional[tuple] = None
 
         # Timers: in-memory, synced to disk every 5 s
         self._timers:       dict[str, TimerState] = {}
@@ -315,47 +339,89 @@ class TinaApp:
 
         self._gap(self._body, 20)
 
-        # Recovery banner (shown once after resume from sleep/restart)
         if self._pending_recovery:
             self._render_recovery(*self._pending_recovery)
             self._pending_recovery = None
             self._sep(self._body, (16, 16))
 
-        # CURRENT FOCUS (pinned)
-        active = self._state.get("active_focus")
-        if active and self._timers.get(active, TimerState(running=False)).running:
-            self._section(self._body, "Current Focus")
-            self._render_project_row(active, pinned=True)
-            self._sep(self._body)
-
-        # PROJECTS (running processes, excluding active focus)
-        others = [p for p in self._projects if p.name != active]
-        if others:
-            self._section(self._body, "Projects")
-            for i, proj in enumerate(others):
+        # ── 1. OPEN APPS ──────────────────────────────────────────
+        self._section(self._body, "Open Apps")
+        if not self._projects:
+            self._dim_row("No dev processes detected. Start a project or dev server.")
+        else:
+            active = self._state.get("active_focus")
+            for i, proj in enumerate(self._projects):
                 self._render_project_row(proj.name, process_state=proj.state)
-                if i < len(others) - 1:
-                    self._gap(self._body, 16)
+                if i < len(self._projects) - 1:
+                    self._gap(self._body, 12)
 
-        # TRACKED FOLDERS (not already shown as running projects)
+        self._sep(self._body)
+
+        # ── 2. FOCUS TIMERS ───────────────────────────────────────
+        self._section(self._body, "Focus Timers")
+        timer_projects = self._projects[:]
+        # Also include any persisted sessions not currently running
+        for name in self._timers:
+            if not any(p.name == name for p in timer_projects):
+                timer_projects.append(type("_P", (), {"name": name, "state": ""})())
+        if not timer_projects:
+            self._dim_row("No projects to track yet.")
+        else:
+            for i, proj in enumerate(timer_projects):
+                self._render_timer_row(proj.name)
+                if i < len(timer_projects) - 1:
+                    self._gap(self._body, 10)
+
+        self._sep(self._body)
+
+        # ── 3. TRACKED FOLDERS ────────────────────────────────────
+        self._section(self._body, "Tracked Folders")
         running_names = {p.name for p in self._projects}
-        new_folders = [f for f in self._folder_projects if f.name not in running_names]
-        if new_folders:
-            if others or (active and self._timers.get(active, TimerState()).running):
-                self._sep(self._body)
-            self._section(self._body, "Tracked Folders")
-            for i, f in enumerate(new_folders):
+        folders = [f for f in self._folder_projects if f.name not in running_names]
+        if not folders:
+            self._dim_row("No project folders found in ~/Documents, ~/Desktop, ~/Projects.")
+        else:
+            for i, f in enumerate(folders):
                 self._render_folder_row(f)
-                if i < len(new_folders) - 1:
-                    self._gap(self._body, 14)
+                if i < len(folders) - 1:
+                    self._gap(self._body, 12)
 
-        # Empty state
-        if not self._projects and not self._folder_projects:
-            self._gap(self._body, 12)
-            tk.Label(self._body, text="Nothing detected.",
-                     bg=BG, fg=DIM, font=F_MD).pack(anchor="w", padx=24)
-            tk.Label(self._body, text="Start a dev server or open a project folder.",
-                     bg=BG, fg=DIM2, font=F_SM).pack(anchor="w", padx=24, pady=(2, 0))
+        self._sep(self._body)
+
+        # ── 4. CONNECTED APIs ─────────────────────────────────────
+        self._section(self._body, "Connected APIs")
+        if not self._api_ports and not self._ext_conns:
+            self._dim_row("No active ports or external connections detected.")
+        else:
+            if self._api_ports:
+                for port, svc in self._api_ports[:12]:
+                    row = tk.Frame(self._body, bg=BG)
+                    row.pack(fill="x", padx=24, pady=1)
+                    tk.Label(row, text=f":{port}", bg=BG, fg=BLUE,
+                             font=F_MONO_SM).pack(side="left")
+                    tk.Label(row, text=f"  {svc}", bg=BG, fg=DIM,
+                             font=F_SM).pack(side="left")
+            if self._ext_conns:
+                self._gap(self._body, 6)
+                tk.Label(self._body, text="External connections",
+                         bg=BG, fg=DIM2, font=F_XS).pack(anchor="w", padx=24)
+                for host in self._ext_conns[:8]:
+                    tk.Label(self._body, text=f"  {host}", bg=BG, fg=DIM,
+                             font=F_MONO_SM).pack(anchor="w", padx=24)
+
+        self._sep(self._body)
+
+        # ── 5. DATA IN / OUT ──────────────────────────────────────
+        self._section(self._body, "Data In / Out")
+        recv, sent = self._net_stats
+        net_row = tk.Frame(self._body, bg=BG)
+        net_row.pack(anchor="w", padx=24)
+        tk.Label(net_row, text="↓ ", bg=BG, fg=GREEN, font=F_SM).pack(side="left")
+        tk.Label(net_row, text=recv, bg=BG, fg=TEXT, font=F_MONO_SM).pack(side="left")
+        tk.Label(net_row, text="   ↑ ", bg=BG, fg=AMBER, font=F_SM).pack(side="left")
+        tk.Label(net_row, text=sent, bg=BG, fg=TEXT, font=F_MONO_SM).pack(side="left")
+        tk.Label(net_row, text="  (since last scan)", bg=BG, fg=DIM2,
+                 font=F_XS).pack(side="left")
 
         # Settings link
         self._sep(self._body, (20, 8))
@@ -364,6 +430,48 @@ class TinaApp:
         self._link(settings_row, "settings", self._show_settings, fg=DIM2).pack(side="left")
 
         self._gap(self._body, 28)
+
+    def _dim_row(self, text: str) -> None:
+        tk.Label(self._body, text=text, bg=BG, fg=DIM2,
+                 font=F_SM).pack(anchor="w", padx=24, pady=(0, 4))
+
+    # ── Timer row (Focus Timers section) ──────────────────────────────────────
+
+    def _render_timer_row(self, name: str) -> None:
+        timer = self._timers.get(name)
+        if not timer:
+            timer = TimerState()
+            self._timers[name] = timer
+
+        frame = tk.Frame(self._body, bg=BG)
+        frame.pack(fill="x")
+
+        # Name + countdown on same line
+        top = tk.Frame(frame, bg=BG)
+        top.pack(fill="x", padx=24)
+        tk.Label(top, text=name, bg=BG, fg=TEXT, font=F_MD_B).pack(side="left")
+
+        countdown = tk.Label(top, text=timer.fmt(), bg=BG,
+                             fg=GREEN if timer.running else DIM, font=F_MONO)
+        countdown.pack(side="right")
+        self._timer_labels[name] = countdown
+
+        # Actions
+        if timer.running:
+            actions = [
+                ("pause",    lambda n=name: self._pause(n)),
+                ("complete", lambda n=name: self._complete(n)),
+            ]
+        elif timer.remaining < FOCUS_DURATION and not timer.done:
+            actions = [
+                ("resume", lambda n=name: self._start(n)),
+                ("reset",  lambda n=name: self._reset(n)),
+            ]
+        else:
+            actions = [
+                ("focus", lambda n=name: self._start(n)),
+            ]
+        self._actions(frame, actions)
 
     # ── Recovery banner ────────────────────────────────────────────────────────
 
@@ -589,7 +697,7 @@ class TinaApp:
                 lbl = self._timer_labels.get(name)
                 if lbl:
                     try:
-                        lbl.config(text=timer.fmt() + " remaining")
+                        lbl.config(text=timer.fmt())
                     except tk.TclError:
                         pass
 
@@ -626,7 +734,6 @@ class TinaApp:
         try:
             procs    = self._monitor.scan()
             projects = self._monitor.group_into_projects(procs)
-            # Drop Tina itself, root processes, and unnamed projects
             projects = [
                 p for p in projects
                 if p.name
@@ -636,25 +743,69 @@ class TinaApp:
         except Exception as exc:
             print(f"[TINA] scan error: {exc}")
             projects = []
+
         try:
             folders = self._folders.scan()
         except Exception as exc:
             print(f"[TINA] folder scan error: {exc}")
             folders = []
-        self._root.after(0, lambda: self._on_scan_done(projects, folders))
 
-    def _on_scan_done(self, projects: list, folders: list) -> None:
+        # Network connections
+        api_ports: list[tuple[int, str]] = []
+        ext_conns: list[str] = []
+        try:
+            conns = psutil.net_connections(kind="tcp")
+            seen_ports: set[int] = set()
+            seen_hosts: set[str] = set()
+            for c in conns:
+                if c.status == "LISTEN" and c.laddr:
+                    port = c.laddr.port
+                    if port not in seen_ports:
+                        seen_ports.add(port)
+                        api_ports.append((port, PORT_NAMES.get(port, "Service")))
+                elif c.status == "ESTABLISHED" and c.raddr:
+                    ip = c.raddr.ip
+                    if not ip.startswith(("127.", "::1", "10.", "192.168.", "172.")):
+                        if ip not in seen_hosts:
+                            seen_hosts.add(ip)
+                            ext_conns.append(ip)
+        except Exception:
+            pass
+        api_ports.sort(key=lambda x: x[0])
+
+        # Network I/O rate
+        net_stats = ("—", "—")
+        try:
+            net = psutil.net_io_counters()
+            now = datetime.now().timestamp()
+            if self._net_prev:
+                prev_r, prev_s, prev_t = self._net_prev
+                dt = max(1.0, now - prev_t)
+                recv_rate = (net.bytes_recv - prev_r) / dt
+                sent_rate = (net.bytes_sent - prev_s) / dt
+                net_stats = (_human_bytes(recv_rate) + "/s", _human_bytes(sent_rate) + "/s")
+            self._net_prev = (net.bytes_recv, net.bytes_sent, now)
+        except Exception:
+            pass
+
+        self._root.after(0, lambda: self._on_scan_done(
+            projects, folders, api_ports, ext_conns, net_stats))
+
+    def _on_scan_done(self, projects: list, folders: list,
+                       api_ports: list, ext_conns: list,
+                       net_stats: tuple) -> None:
         self._projects        = projects
         self._folder_projects = folders
+        self._api_ports       = api_ports
+        self._ext_conns       = ext_conns
+        self._net_stats       = net_stats
         self._scanning        = False
 
-        # Ensure every detected project has a timer slot
         project_names = {p.name for p in self._projects}
         for p in self._projects:
             if p.name not in self._timers:
                 self._timers[p.name] = TimerState()
 
-        # Clear active_focus if it points to a project no longer detected
         active = self._state.get("active_focus")
         if active and active not in project_names:
             self._state["active_focus"] = None
