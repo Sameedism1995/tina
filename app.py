@@ -177,6 +177,9 @@ class TinaApp:
         # Focus queue — ordered list of project names waiting to run
         self._focus_queue: list[str] = []
 
+        # History search filter — persists across renders
+        self._log_filter: str = ""
+
         # Timers: in-memory, synced to disk every 5 s
         self._timers:      dict[str, TimerState]  = {}
         self._timer_vars:  dict[str, tk.StringVar] = {}  # live countdown text
@@ -532,6 +535,11 @@ class TinaApp:
                 tk.Label(row, text=f"  {ev.event}", bg=BG, fg=DIM, font=F_SM).pack(side="left")
                 tk.Label(row, text=f"  {ev.age}", bg=BG, fg=DIM2, font=F_XS).pack(side="left")
 
+        self._sep(self._body)
+
+        # ── 6. HISTORY ────────────────────────────────────────────
+        self._render_history_section()
+
         # Settings link
         self._sep(self._body, (20, 8))
         settings_row = tk.Frame(self._body, bg=BG)
@@ -543,6 +551,77 @@ class TinaApp:
     def _dim_row(self, text: str) -> None:
         tk.Label(self._body, text=text, bg=BG, fg=DIM2,
                  font=F_SM).pack(anchor="w", padx=24, pady=(0, 4))
+
+    # ── History / log section ─────────────────────────────────────────────────
+
+    def _render_history_section(self) -> None:
+        """Searchable activity log — filters live without re-rendering the full UI."""
+        # Header + search box on the same row
+        hdr = tk.Frame(self._body, bg=BG)
+        hdr.pack(fill="x", padx=24, pady=(0, 8))
+        tk.Label(hdr, text="HISTORY", bg=BG, fg=DIM, font=F_SEC).pack(side="left")
+
+        search_var = tk.StringVar(value=self._log_filter)
+        entry = tk.Entry(
+            hdr,
+            textvariable=search_var,
+            bg=BG2, fg=TEXT, insertbackground=TEXT,
+            bd=0, highlightthickness=1,
+            highlightbackground=DIM2, highlightcolor=DIM,
+            font=F_SM, relief="flat", width=22,
+        )
+        entry.pack(side="right")
+
+        # Container rebuilt on each filter change
+        log_frame = tk.Frame(self._body, bg=BG)
+        log_frame.pack(fill="x")
+
+        def _refresh(*_):
+            self._log_filter = search_var.get()
+            for w in log_frame.winfo_children():
+                w.destroy()
+            _populate()
+
+        def _populate():
+            entries = self._state.get("log", [])
+            filt    = self._log_filter.strip().lower()
+            today   = datetime.now().strftime("%Y-%m-%d")
+            shown   = 0
+            for e in entries:
+                ts    = e.get("ts", "")
+                event = e.get("event", "")
+                if filt and filt not in ts.lower() and filt not in event.lower():
+                    continue
+
+                # Format timestamp: "today 14:30" or "Jun 16  14:30"
+                if ts.startswith(today):
+                    label_ts = "today  " + ts[11:]
+                elif len(ts) > 5:
+                    try:
+                        dt = datetime.strptime(ts, "%Y-%m-%d %H:%M")
+                        label_ts = dt.strftime("%b %d  %H:%M")
+                    except ValueError:
+                        label_ts = ts
+                else:
+                    label_ts = ts  # legacy HH:MM only
+
+                row = tk.Frame(log_frame, bg=BG)
+                row.pack(fill="x", padx=24, pady=1)
+                tk.Label(row, text=label_ts, bg=BG, fg=DIM2,
+                         font=F_MONO_SM, width=14, anchor="w").pack(side="left")
+                tk.Label(row, text=event, bg=BG, fg=DIM,
+                         font=F_SM, anchor="w").pack(side="left")
+                shown += 1
+                if shown >= 50:
+                    break
+
+            if shown == 0:
+                tk.Label(log_frame,
+                         text="No matching entries." if filt else "No activity yet.",
+                         bg=BG, fg=DIM2, font=F_SM).pack(anchor="w", padx=24)
+
+        _populate()
+        search_var.trace_add("write", _refresh)
 
     # ── Timer row (Focus Timers section) ──────────────────────────────────────
 

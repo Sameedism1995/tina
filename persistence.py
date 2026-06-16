@@ -53,6 +53,6 @@ def save_state(state: dict) -> None:
 
 
 def append_log(state: dict, event: str) -> None:
-    entry = {"ts": datetime.now().strftime("%H:%M"), "event": event}
-    state["log"] = [entry, *state["log"]][:60]
+    entry = {"ts": datetime.now().strftime("%Y-%m-%d %H:%M"), "event": event}
+    state["log"] = [entry, *state["log"]][:200]
     save_state(state)
