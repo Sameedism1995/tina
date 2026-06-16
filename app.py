@@ -174,6 +174,9 @@ class TinaApp:
             self._state.get("preferences", {}).get("focus_minutes", 25) * 60
         )
 
+        # Focus queue — ordered list of project names waiting to run
+        self._focus_queue: list[str] = []
+
         # Timers: in-memory, synced to disk every 5 s
         self._timers:      dict[str, TimerState]  = {}
         self._timer_vars:  dict[str, tk.StringVar] = {}  # live countdown text
@@ -442,6 +445,16 @@ class TinaApp:
                 _hover(lbl, TEXT, lambda: DIM)
                 lbl.pack(side="left")
 
+        # Queue overview — shown only when there are queued projects
+        if self._focus_queue:
+            q_row = tk.Frame(self._body, bg=BG)
+            q_row.pack(fill="x", padx=24, pady=(0, 10))
+            tk.Label(q_row, text="up next: ", bg=BG, fg=DIM2, font=F_XS).pack(side="left")
+            for i, qname in enumerate(self._focus_queue):
+                if i:
+                    tk.Label(q_row, text=" → ", bg=BG, fg=DIM2, font=F_XS).pack(side="left")
+                tk.Label(q_row, text=qname, bg=BG, fg=DIM, font=F_XS).pack(side="left")
+
         timer_projects = self._projects[:]
         # Also include any persisted sessions not currently running
         for name in self._timers:
@@ -539,8 +552,8 @@ class TinaApp:
             timer = TimerState()
             self._timers[name] = timer
 
-        # Persist StringVar across re-renders so _timer_tick can update without
-        # needing a stale widget reference
+        queue_pos = self._focus_queue.index(name) if name in self._focus_queue else -1
+
         if name not in self._timer_vars:
             self._timer_vars[name] = tk.StringVar()
         var = self._timer_vars[name]
@@ -551,7 +564,13 @@ class TinaApp:
 
         top = tk.Frame(frame, bg=BG)
         top.pack(fill="x", padx=24)
+
+        # Name + queue position badge
         tk.Label(top, text=name, bg=BG, fg=TEXT, font=F_MD_B).pack(side="left")
+        if queue_pos == 0 and not timer.running:
+            tk.Label(top, text="  next up", bg=BG, fg=GREEN, font=F_XS).pack(side="left")
+        elif queue_pos > 0:
+            tk.Label(top, text=f"  #{queue_pos + 1} in queue", bg=BG, fg=DIM, font=F_XS).pack(side="left")
 
         if timer.running:
             clr = GREEN
@@ -564,7 +583,28 @@ class TinaApp:
         countdown.pack(side="right")
         self._timer_labels[name] = countdown
 
-        self._actions(frame, self._timer_action_items(name, timer, notes=False))
+        # Queue-aware actions
+        if timer.running:
+            actions: list = [
+                ("pause",    lambda n=name: self._pause(n)),
+                ("complete", lambda n=name: self._complete(n)),
+            ]
+        elif timer.remaining < self._focus_duration and not timer.done:
+            actions = [
+                ("resume", lambda n=name: self._start(n)),
+                ("reset",  lambda n=name: self._reset(n)),
+            ]
+        elif queue_pos >= 0:
+            actions = [
+                ("focus",  lambda n=name: self._start(n)),
+                ("remove from queue", lambda n=name: self._dequeue(n)),
+            ]
+        else:
+            actions = [
+                ("focus",   lambda n=name: self._start(n)),
+                ("+ queue", lambda n=name: self._enqueue(n)),
+            ]
+        self._actions(frame, actions)
 
     # ── Recovery banner ────────────────────────────────────────────────────────
 
@@ -737,6 +777,8 @@ class TinaApp:
         append_log(self._state, f"Focus complete: {project}")
         self._render()
         self._notify(project, "Focus session complete")
+        # Advance queue 1.5 s later — gives the notification time to register
+        self._root.after(1500, self._advance_queue)
 
     def _reset(self, project: str) -> None:
         if project in self._timers:
@@ -767,6 +809,36 @@ class TinaApp:
         else:
             self._notes_open.add(project)
         self._render()
+
+    # ── Focus queue ────────────────────────────────────────────────────────────
+
+    def _enqueue(self, name: str) -> None:
+        if name not in self._focus_queue:
+            self._focus_queue.append(name)
+        self._render()
+
+    def _dequeue(self, name: str) -> None:
+        if name in self._focus_queue:
+            self._focus_queue.remove(name)
+        self._render()
+
+    def _advance_queue(self) -> None:
+        """After a session completes: minimise Tina, then pop and start the next project."""
+        if not self._focus_queue:
+            return
+        next_project = self._focus_queue.pop(0)
+        self._root.iconify()
+        self._root.after(2000, lambda: self._launch_next(next_project))
+
+    def _launch_next(self, project: str) -> None:
+        self._start(project)
+        self._root.deiconify()
+        self._root.lift()
+        try:
+            self._root.focus_force()
+        except Exception:
+            pass
+        self._notify(project, "Next focus session starting")
 
     # ── Timer tick — 1 Hz, in-place label updates ──────────────────────────────
 
