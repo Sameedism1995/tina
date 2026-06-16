@@ -62,7 +62,7 @@ F_MONO = ("Menlo", 12)
 F_MONO_SM = ("Menlo", 10)
 
 REFRESH_S      = 30
-FOCUS_DURATION = 25 * 60   # seconds
+FOCUS_DURATION = 25 * 60   # seconds — default; actual duration stored in state prefs
 
 # Port → service name
 PORT_NAMES: dict[int, str] = {
@@ -169,6 +169,11 @@ class TinaApp:
         self._notes_open:      set[str] = set()
         self._pending_recovery: Optional[tuple] = None
 
+        # Focus duration — loaded from prefs, in seconds
+        self._focus_duration: int = (
+            self._state.get("preferences", {}).get("focus_minutes", 25) * 60
+        )
+
         # Timers: in-memory, synced to disk every 5 s
         self._timers:      dict[str, TimerState]  = {}
         self._timer_vars:  dict[str, tk.StringVar] = {}  # live countdown text
@@ -195,7 +200,7 @@ class TinaApp:
     def _restore_timers(self) -> None:
         for proj, sess in self._state.get("sessions", {}).items():
             self._timers[proj] = TimerState(
-                remaining=sess.get("remaining", FOCUS_DURATION),
+                remaining=sess.get("remaining", self._focus_duration),
                 running=False,   # never auto-run on cold load; handled by startup
             )
 
@@ -231,7 +236,7 @@ class TinaApp:
                 if elapsed > 60:
                     sess         = self._state.get("sessions", {}).get(active_focus, {})
                     was_running  = sess.get("running", False)
-                    remaining    = sess.get("remaining", FOCUS_DURATION)
+                    remaining    = sess.get("remaining", self._focus_duration)
                     if was_running:
                         new_rem   = max(0, remaining - int(elapsed))
                         behavior  = prefs.get("wake_behavior", "ask_after_wake")
@@ -377,7 +382,7 @@ class TinaApp:
                 ("pause",    lambda n=name: self._pause(n)),
                 ("complete", lambda n=name: self._complete(n)),
             ]
-        elif timer and not timer.running and timer.remaining < FOCUS_DURATION and not timer.done:
+        elif timer and not timer.running and timer.remaining < self._focus_duration and not timer.done:
             items = [
                 ("resume", lambda n=name: self._start(n)),
                 ("reset",  lambda n=name: self._reset(n)),
@@ -416,7 +421,27 @@ class TinaApp:
         self._sep(self._body)
 
         # ── 2. FOCUS TIMERS ───────────────────────────────────────
-        self._section(self._body, "Focus Timers")
+        # Section header + duration picker on the same row
+        hdr_row = tk.Frame(self._body, bg=BG)
+        hdr_row.pack(fill="x", padx=24, pady=(0, 10))
+        tk.Label(hdr_row, text="FOCUS TIMERS", bg=BG, fg=DIM, font=F_SEC).pack(side="left")
+
+        cur_mins = self._focus_duration // 60
+        dur_row = tk.Frame(hdr_row, bg=BG)
+        dur_row.pack(side="right")
+        for i, mins in enumerate([15, 20, 25, 30, 45, 60]):
+            if i:
+                tk.Label(dur_row, text=" · ", bg=BG, fg=DIM2, font=F_XS).pack(side="left")
+            if mins == cur_mins:
+                tk.Label(dur_row, text=f"{mins}m", bg=BG, fg=GREEN,
+                         font=("Menlo", 10, "bold")).pack(side="left")
+            else:
+                lbl = tk.Label(dur_row, text=f"{mins}m", bg=BG, fg=DIM, font=F_MONO_SM,
+                               cursor="hand2")
+                lbl.bind("<Button-1>", lambda _, m=mins: self._set_duration(m))
+                _hover(lbl, TEXT, lambda: DIM)
+                lbl.pack(side="left")
+
         timer_projects = self._projects[:]
         # Also include any persisted sessions not currently running
         for name in self._timers:
@@ -530,7 +555,7 @@ class TinaApp:
 
         if timer.running:
             clr = GREEN
-        elif timer.remaining < FOCUS_DURATION and not timer.done:
+        elif timer.remaining < self._focus_duration and not timer.done:
             clr = AMBER
         else:
             clr = DIM
@@ -572,7 +597,7 @@ class TinaApp:
         # Status dot — timer state takes priority over CPU state
         if timer and timer.running:
             dot, dot_fg = "● focusing", GREEN
-        elif timer and not timer.running and timer.remaining < FOCUS_DURATION:
+        elif timer and not timer.running and timer.remaining < self._focus_duration:
             dot, dot_fg = "● paused", AMBER
         elif process_state == "ACTIVE":
             dot, dot_fg = "● active", GREEN
@@ -638,7 +663,7 @@ class TinaApp:
         tk.Label(frame, text=f.project_type, bg=BG, fg=DIM2,
                  font=F_XS).pack(anchor="w", padx=24)
 
-        if timer and timer.remaining < FOCUS_DURATION:
+        if timer and timer.remaining < self._focus_duration:
             tk.Label(frame, text=timer.fmt() + " remaining",
                      bg=BG, fg=DIM, font=F_MONO).pack(anchor="w", padx=24, pady=(2, 0))
 
@@ -685,7 +710,7 @@ class TinaApp:
             self._timers[project] = TimerState()
         t = self._timers[project]
         if t.done or t.remaining <= 0:
-            t.remaining = FOCUS_DURATION
+            t.remaining = self._focus_duration
         t.done = False   # always clear so pause→resume works after a completed session
         t.running = True
         self._state["active_focus"] = project
@@ -705,7 +730,7 @@ class TinaApp:
         if project in self._timers:
             t = self._timers[project]
             t.running   = False
-            t.remaining = FOCUS_DURATION
+            t.remaining = self._focus_duration
             t.done      = True
         self._state["active_focus"] = None
         self._sync_timer(project, running=False)
@@ -716,12 +741,24 @@ class TinaApp:
     def _reset(self, project: str) -> None:
         if project in self._timers:
             t = self._timers[project]
-            t.remaining = FOCUS_DURATION
+            t.remaining = self._focus_duration
             t.running   = False
             t.done      = False
         if self._state.get("active_focus") == project:
             self._state["active_focus"] = None
         self._sync_timer(project, running=False)
+        self._render()
+
+    def _set_duration(self, minutes: int) -> None:
+        new_secs = minutes * 60
+        old_secs = self._focus_duration
+        self._focus_duration = new_secs
+        self._state.setdefault("preferences", {})["focus_minutes"] = minutes
+        # Reset any idle (untouched) timers to the new duration
+        for t in self._timers.values():
+            if not t.running and not t.done and t.remaining == old_secs:
+                t.remaining = new_secs
+        save_state(self._state)
         self._render()
 
     def _toggle_notes(self, project: str) -> None:
